@@ -1,3 +1,12 @@
 import sqlite3 
 
-#Lets figure out a way to connect to underdog to get live adp rankings
+DB_PATH = "fantasy.db"
+
+def players_database():
+  conn = sqlite3.connect(DB_PATH)
+  cur = conn.cursor()
+
+  cur.executescript("""
+    CREATE TABLE IF NOT EXISTS players;
+
+    CREATE TABLE players
