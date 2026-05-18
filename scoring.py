@@ -68,34 +68,42 @@ def build_value_curve(
 ) -> dict[int, float]:
     """Return {adp_bucket: expected_ppr_points}.
 
+    Joins each season's stats with ADP snapshots captured BEFORE that
+    season's results — i.e. snapshots from the same calendar year, taken
+    pre-Sept. This avoids leakage where a current-day snapshot gets
+    matched to historical PPR and trivially predicts it.
+
     Bucket size groups adjacent ADP slots so a single noisy outcome
     doesn't dominate. With bucket_size=6 (≈ half a round in a 12-team
     draft), bucket 0 covers ADP 1-6, bucket 1 covers 7-12, etc.
-
-    Until we have real historical ADP data, callers can also pass a
-    synthetic curve derived from `_synthetic_curve_from_ppr_rank` which
-    treats prior-season PPR rank as a proxy for where a player would
-    have been drafted.
     """
     if not seasons:
         return {}
-    placeholders = ",".join("?" * len(seasons))
-    rows = conn.execute(
-        f"""
-        SELECT a.adp_rank, s.fantasy_points_ppr
-        FROM adp_snapshots a
-        JOIN player_season_stats s
-          ON s.player_id = a.player_id AND s.season IN ({placeholders})
-        WHERE a.draft_format = ? AND a.adp_rank IS NOT NULL
-              AND s.fantasy_points_ppr IS NOT NULL
-        """,
-        (*seasons, draft_format),
-    ).fetchall()
 
     bucket_totals: dict[int, list[float]] = {}
-    for r in rows:
-        bucket = (r["adp_rank"] - 1) // bucket_size
-        bucket_totals.setdefault(bucket, []).append(float(r["fantasy_points_ppr"]))
+    for season in seasons:
+        # Snapshots captured during the offseason / early-season for `season`.
+        # We bracket on Jan-Sep of that year to exclude in-season redrafts
+        # and any post-season cleanup.
+        lo = f"{season}-01-01T00:00:00"
+        hi = f"{season}-09-15T00:00:00"
+        rows = conn.execute(
+            """
+            SELECT a.adp_rank, s.fantasy_points_ppr
+            FROM adp_snapshots a
+            JOIN player_season_stats s
+              ON s.player_id = a.player_id AND s.season = ?
+            WHERE a.draft_format = ?
+              AND a.adp_rank IS NOT NULL
+              AND s.fantasy_points_ppr IS NOT NULL
+              AND a.captured_at >= ?
+              AND a.captured_at < ?
+            """,
+            (season, draft_format, lo, hi),
+        ).fetchall()
+        for r in rows:
+            bucket = (r["adp_rank"] - 1) // bucket_size
+            bucket_totals.setdefault(bucket, []).append(float(r["fantasy_points_ppr"]))
 
     return {b: sum(v) / len(v) for b, v in bucket_totals.items() if v}
 
@@ -207,42 +215,51 @@ def score_players(
     return len(rows)
 
 
-def top_values(season: int, model_version: str = DEFAULT_MODEL_VERSION, limit: int = 20, db_path: str = DB_PATH):
+_RANKING_SQL = """
+    WITH latest AS (
+        SELECT player_id, adp, adp_rank
+        FROM adp_snapshots
+        WHERE (player_id, captured_at) IN (
+            SELECT player_id, MAX(captured_at) FROM adp_snapshots GROUP BY player_id
+        )
+    )
+    SELECT p.full_name, p.position, p.team,
+           s.score, s.rank,
+           latest.adp AS latest_adp,
+           latest.adp_rank AS latest_adp_rank
+    FROM player_scores s
+    JOIN players p USING (player_id)
+    JOIN latest USING (player_id)
+    WHERE s.season = ? AND s.model_version = ?
+    ORDER BY s.score {direction}
+    LIMIT ?
+"""
+
+
+def top_values(
+    season: int,
+    model_version: str = DEFAULT_MODEL_VERSION,
+    limit: int = 20,
+    db_path: str = DB_PATH,
+):
     """Players whose score exceeds expectation at their ADP — best buys."""
     with connect(db_path) as conn:
         return conn.execute(
-            """
-            SELECT p.full_name, p.position, p.team,
-                   s.score, s.rank,
-                   (SELECT adp FROM adp_snapshots a
-                    WHERE a.player_id = p.player_id
-                    ORDER BY captured_at DESC LIMIT 1) AS latest_adp
-            FROM player_scores s JOIN players p USING (player_id)
-            WHERE s.season = ? AND s.model_version = ?
-              AND latest_adp IS NOT NULL
-            ORDER BY s.score DESC
-            LIMIT ?
-            """,
+            _RANKING_SQL.format(direction="DESC"),
             (season, model_version, limit),
         ).fetchall()
 
 
-def top_reaches(season: int, model_version: str = DEFAULT_MODEL_VERSION, limit: int = 20, db_path: str = DB_PATH):
+def top_reaches(
+    season: int,
+    model_version: str = DEFAULT_MODEL_VERSION,
+    limit: int = 20,
+    db_path: str = DB_PATH,
+):
     """Players whose score is well below expectation at their ADP."""
     with connect(db_path) as conn:
         return conn.execute(
-            """
-            SELECT p.full_name, p.position, p.team,
-                   s.score, s.rank,
-                   (SELECT adp FROM adp_snapshots a
-                    WHERE a.player_id = p.player_id
-                    ORDER BY captured_at DESC LIMIT 1) AS latest_adp
-            FROM player_scores s JOIN players p USING (player_id)
-            WHERE s.season = ? AND s.model_version = ?
-              AND latest_adp IS NOT NULL
-            ORDER BY s.score ASC
-            LIMIT ?
-            """,
+            _RANKING_SQL.format(direction="ASC"),
             (season, model_version, limit),
         ).fetchall()
 

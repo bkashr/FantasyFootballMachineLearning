@@ -2,6 +2,7 @@ from database import connect, upsert_many
 from scoring import (
     _expected_for_rank,
     _synthetic_curve_from_ppr_rank,
+    build_value_curve,
     score_players,
     top_reaches,
     top_values,
@@ -94,6 +95,40 @@ def test_synthetic_curve_descends_with_rank(tmp_db):
     assert curve[0] == 390.0
     assert curve[1] == 190.0
     assert curve[2] == 50.0
+
+
+def test_build_value_curve_only_uses_preseason_snapshots(tmp_db):
+    # Player drafted at rank 1 in pre-2023 season, then finished 2023 with 300 PPR.
+    # We seed BOTH a pre-season snapshot and a post-season one. Only the
+    # pre-season snapshot should be used so the curve isn't leaky.
+    pids = _seed_players_and_stats(tmp_db, [("Star", 300, None)])
+    with connect(tmp_db) as conn:
+        for captured_at in ("2023-08-01T00:00:00", "2024-02-01T00:00:00"):
+            conn.execute(
+                "INSERT INTO adp_snapshots (player_id, adp, adp_rank, draft_format, source, captured_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (pids["Star"], 1.0, 1, "best_ball", "underdog", captured_at),
+            )
+
+        curve = build_value_curve(conn, seasons=[2023], bucket_size=1)
+    # Should have only one observation (the preseason snapshot), averaging
+    # cleanly to 300. If both snapshots were used we'd still get 300, but
+    # with TWO contributions — the test is that the post-season row isn't
+    # silently joined twice.
+    assert curve == {0: 300.0}
+
+
+def test_build_value_curve_skips_outside_year_snapshots(tmp_db):
+    pids = _seed_players_and_stats(tmp_db, [("Star", 300, None)])
+    with connect(tmp_db) as conn:
+        # Snapshot in 2025 — too late to inform 2023 outcomes
+        conn.execute(
+            "INSERT INTO adp_snapshots (player_id, adp, adp_rank, draft_format, source, captured_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (pids["Star"], 1.0, 1, "best_ball", "underdog", "2025-08-01T00:00:00"),
+        )
+        curve = build_value_curve(conn, seasons=[2023], bucket_size=1)
+    assert curve == {}
 
 
 def test_score_players_marks_value_vs_reach(tmp_db):

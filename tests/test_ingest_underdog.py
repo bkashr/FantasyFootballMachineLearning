@@ -18,6 +18,18 @@ def test_normalize_name_strips_punctuation_and_case():
     assert _normalize_name("Amon-Ra St. Brown") == "amon ra st brown"
 
 
+def test_normalize_name_drops_generational_suffixes():
+    # Jr/Sr/II/III/IV should not split a player into two crosswalk entries
+    assert _normalize_name("Marvin Harrison Jr.") == _normalize_name("Marvin Harrison")
+    assert _normalize_name("Odell Beckham Jr.") == _normalize_name("Odell Beckham")
+    assert _normalize_name("Calvin Ridley III") == "calvin ridley"
+    assert _normalize_name("Cedric Tillman, Sr.") == "cedric tillman"
+
+
+def test_normalize_name_collapses_whitespace():
+    assert _normalize_name("  Patrick   Mahomes  ") == "patrick mahomes"
+
+
 def test_normalize_adp_response_handles_alternate_keys():
     raw = {
         "players": [

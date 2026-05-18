@@ -82,14 +82,19 @@ def _build_lookups(conn):
     return by_uid, by_name
 
 
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
 def _normalize_name(name: str) -> str:
-    return (
-        name.lower()
-        .replace(".", "")
-        .replace("'", "")
-        .replace("-", " ")
-        .strip()
-    )
+    """Lowercase, strip punctuation, collapse whitespace, drop common
+    generational suffixes (Jr., Sr., II/III/IV). This handles the
+    crosswalk edge cases PLANNING.md flags — Underdog's 'AJ Brown'
+    vs nflverse's 'A.J. Brown', or 'Marvin Harrison Jr.' vs 'Marvin
+    Harrison' when one source omits the suffix."""
+    s = name.lower().replace(".", "").replace("'", "").replace(",", "")
+    s = s.replace("-", " ")
+    tokens = [t for t in s.split() if t and t not in _NAME_SUFFIXES]
+    return " ".join(tokens)
 
 
 def _resolve_player(rec: dict, by_uid: dict, by_name: dict) -> int | None:
