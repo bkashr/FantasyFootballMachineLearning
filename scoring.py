@@ -60,6 +60,20 @@ def _projection_from_prior_season(conn, season: int) -> dict[int, float]:
     return {r["player_id"]: float(r["fantasy_points_ppr"]) for r in rows}
 
 
+def _projection_from_table(conn, season: int, source: str) -> dict[int, float]:
+    """Read projections from player_projections. Source tag picks the
+    model — 'internal_v2' is the Phase-2 projection."""
+    rows = conn.execute(
+        """
+        SELECT player_id, projected_points_ppr
+        FROM player_projections
+        WHERE season = ? AND source = ? AND projected_points_ppr IS NOT NULL
+        """,
+        (season, source),
+    ).fetchall()
+    return {r["player_id"]: float(r["projected_points_ppr"]) for r in rows}
+
+
 def build_value_curve(
     conn,
     seasons: list[int],
@@ -148,6 +162,7 @@ def score_players(
     bucket_size: int = 6,
     db_path: str = DB_PATH,
     curve: dict[int, float] | None = None,
+    projection_source: str | None = None,
 ) -> int:
     """Compute and store scores for `season`. Returns rows written.
 
@@ -156,10 +171,23 @@ def score_players(
     once we have proper historical ADP. If None, we try a real curve
     from prior-season ADP and fall back to a synthetic curve derived
     from prior-season PPR finish.
+
+    `projection_source`: if set, pull projections from
+    player_projections WHERE source = projection_source (e.g.
+    'internal_v2'). If None, fall back to using the prior season's
+    PPR directly — that's the baseline_v1 behavior.
     """
     init_db(db_path)
     with connect(db_path) as conn:
-        projections = _projection_from_prior_season(conn, season)
+        if projection_source:
+            projections = _projection_from_table(conn, season, projection_source)
+            log.info(
+                "Using %d projections from source=%s",
+                len(projections),
+                projection_source,
+            )
+        else:
+            projections = _projection_from_prior_season(conn, season)
         adp = _latest_adp(conn, draft_format=draft_format)
 
         if curve is None:
@@ -279,6 +307,12 @@ def main():
     p.add_argument("--season", type=int, required=True, help="Season to score (uses prior season's stats as projection)")
     p.add_argument("--model-version", default=DEFAULT_MODEL_VERSION)
     p.add_argument("--draft-format", default="best_ball")
+    p.add_argument(
+        "--projection-source",
+        default=None,
+        help="Read projections from player_projections WHERE source=<this>. "
+        "If omitted, falls back to prior-season PPR (baseline_v1).",
+    )
     p.add_argument("--db", default=DB_PATH)
     p.add_argument("--show", type=int, default=10, help="Print top N values and reaches after scoring")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -294,6 +328,7 @@ def main():
         model_version=args.model_version,
         draft_format=args.draft_format,
         db_path=args.db,
+        projection_source=args.projection_source,
     )
 
     if args.show:

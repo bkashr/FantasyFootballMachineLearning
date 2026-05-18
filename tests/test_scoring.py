@@ -1,3 +1,5 @@
+import pytest
+
 from database import connect, upsert_many
 from scoring import (
     _expected_for_rank,
@@ -173,6 +175,56 @@ def test_score_players_marks_value_vs_reach(tmp_db):
     assert reaches[0]["full_name"] == "Mid A"
     assert values[0]["score"] > 0
     assert reaches[0]["score"] < 0
+
+
+def test_score_players_reads_projection_from_table(tmp_db):
+    # Seed two players with prior PPR and a current-day ADP each.
+    pids = _seed_players_and_stats(
+        tmp_db,
+        [
+            ("Underprojected Player", 150, None),   # prior PPR 150
+            ("Overprojected Player",  150, None),   # same prior PPR
+        ],
+    )
+    _seed_adp(
+        tmp_db,
+        pids,
+        {
+            "Underprojected Player": (10.0, 10),
+            "Overprojected Player":  (10.0, 10),
+        },
+    )
+
+    # Now write differing projections to player_projections.
+    with connect(tmp_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO player_projections
+                (player_id, season, source, projected_points_ppr, captured_at)
+            VALUES (?, 2024, 'internal_v2', ?, '2026-01-01T00:00:00')
+            """,
+            [
+                (pids["Underprojected Player"], 300.0),
+                (pids["Overprojected Player"],  50.0),
+            ],
+        )
+
+    score_players(
+        season=2024,
+        db_path=tmp_db,
+        bucket_size=1,
+        curve={9: 150.0},  # expected_at_rank_10 = 150
+        projection_source="internal_v2",
+    )
+
+    with connect(tmp_db) as conn:
+        rows = dict(conn.execute(
+            "SELECT p.full_name, s.score FROM player_scores s "
+            "JOIN players p USING (player_id) WHERE s.season = 2024"
+        ))
+    # Underprojected: 300 - 150 = +150. Overprojected: 50 - 150 = -100.
+    assert rows["Underprojected Player"] == pytest.approx(150.0)
+    assert rows["Overprojected Player"] == pytest.approx(-100.0)
 
 
 def test_score_players_skips_players_with_no_adp(tmp_db):
