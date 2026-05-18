@@ -173,3 +173,21 @@ def test_score_players_marks_value_vs_reach(tmp_db):
     assert reaches[0]["full_name"] == "Mid A"
     assert values[0]["score"] > 0
     assert reaches[0]["score"] < 0
+
+
+def test_score_players_skips_players_with_no_adp(tmp_db):
+    # Two players with prior PPR but no ADP at all → should not be scored.
+    pids = _seed_players_and_stats(
+        tmp_db,
+        [
+            ("Ghost A", 300, None),
+            ("Ghost B", 200, None),
+        ],
+    )
+    injected = {0: 250.0}  # single-bucket curve
+    n = score_players(season=2024, db_path=tmp_db, curve=injected)
+    assert n == 0
+
+    with connect(tmp_db) as conn:
+        scores = conn.execute("SELECT COUNT(*) FROM player_scores").fetchone()[0]
+    assert scores == 0

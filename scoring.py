@@ -179,16 +179,21 @@ def score_players(
 
         computed_at = dt.datetime.utcnow().isoformat(timespec="seconds")
         rows = []
+        skipped_no_adp = 0
         for player_id, proj in projections.items():
             adp_rank = adp.get(player_id, (None, None))[1]
             expected = _expected_for_rank(adp_rank, curve, bucket_size)
-            score = proj - (expected if expected is not None else 0.0)
+            if expected is None:
+                # No ADP or off the curve — score = projection - expected is
+                # undefined. Skip rather than reporting a misleading number.
+                skipped_no_adp += 1
+                continue
             rows.append(
                 {
                     "player_id": player_id,
                     "season": season,
                     "model_version": model_version,
-                    "score": score,
+                    "score": proj - expected,
                     "rank": None,
                     "computed_at": computed_at,
                 }
@@ -197,6 +202,11 @@ def score_players(
         rows.sort(key=lambda r: r["score"], reverse=True)
         for i, r in enumerate(rows, start=1):
             r["rank"] = i
+        if skipped_no_adp:
+            log.info(
+                "Skipped %d players with no current ADP (can't compute value)",
+                skipped_no_adp,
+            )
 
         if rows:
             cols = ["player_id", "season", "model_version", "score", "rank", "computed_at"]
