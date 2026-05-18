@@ -1,10 +1,30 @@
 import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
 
 DB_PATH = "fantasy.db"
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
+@contextmanager
+def connect(db_path: str = DB_PATH):
+    """Yield a sqlite3 connection with foreign keys enabled. Commits on
+    clean exit, rolls back on exception, always closes."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db(db_path: str = DB_PATH):
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     cur.executescript("""
@@ -158,6 +178,49 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def upsert(conn, table: str, row: dict, conflict_cols: list[str]):
+    """Insert or update a single row keyed on conflict_cols. Used by
+    ingest scripts so re-runs don't duplicate."""
+    cols = list(row.keys())
+    placeholders = ",".join(["?"] * len(cols))
+    col_list = ",".join(cols)
+    update_cols = [c for c in cols if c not in conflict_cols]
+    if update_cols:
+        update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+        sql = (
+            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT({','.join(conflict_cols)}) DO UPDATE SET {update_clause}"
+        )
+    else:
+        sql = (
+            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT({','.join(conflict_cols)}) DO NOTHING"
+        )
+    conn.execute(sql, [row[c] for c in cols])
+
+
+def upsert_many(conn, table: str, rows: list[dict], conflict_cols: list[str]):
+    """Bulk version of upsert. Assumes every row has the same keys."""
+    if not rows:
+        return
+    cols = list(rows[0].keys())
+    placeholders = ",".join(["?"] * len(cols))
+    col_list = ",".join(cols)
+    update_cols = [c for c in cols if c not in conflict_cols]
+    if update_cols:
+        update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+        sql = (
+            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT({','.join(conflict_cols)}) DO UPDATE SET {update_clause}"
+        )
+    else:
+        sql = (
+            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT({','.join(conflict_cols)}) DO NOTHING"
+        )
+    conn.executemany(sql, [[r[c] for c in cols] for r in rows])
 
 
 if __name__ == "__main__":
