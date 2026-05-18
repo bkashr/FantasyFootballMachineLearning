@@ -68,18 +68,45 @@ def normalize_adp_response(raw: dict) -> list[dict]:
     return out
 
 
+FANTASY_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DST", "FB"}
+
+
 def _build_lookups(conn):
-    """Return (by_underdog_id, by_normalized_name) lookups into players."""
+    """Return three lookups into the players table:
+    - by_underdog_id: {underdog_id: player_id}
+    - by_name_pos:    {(normalized_name, position): player_id}
+    - by_name:        {normalized_name: player_id}
+
+    Name+position is preferred over name alone — that's how we keep
+    'Josh Allen QB' from matching 'Josh Allen LB'."""
     by_uid: dict[str, int] = {}
-    by_name: dict[str, int] = {}
+    by_name_pos: dict[tuple[str, str], int] = {}
+    by_name: dict[str, list[int]] = {}
     for r in conn.execute(
-        "SELECT player_id, full_name, underdog_id FROM players"
+        "SELECT player_id, full_name, position, underdog_id FROM players"
     ):
         if r["underdog_id"]:
             by_uid[r["underdog_id"]] = r["player_id"]
         if r["full_name"]:
-            by_name[_normalize_name(r["full_name"])] = r["player_id"]
-    return by_uid, by_name
+            nm = _normalize_name(r["full_name"])
+            if r["position"]:
+                by_name_pos[(nm, r["position"])] = r["player_id"]
+            by_name.setdefault(nm, []).append(r["player_id"])
+    # Collapse name-only lookup, but prefer fantasy-relevant positions
+    # when there's a collision so 'Josh Allen' alone still lands on the QB.
+    name_singletons: dict[str, int] = {}
+    for nm, pids in by_name.items():
+        if len(pids) == 1:
+            name_singletons[nm] = pids[0]
+            continue
+        fantasy_pids = [
+            pid for (nm2, pos), pid in by_name_pos.items()
+            if nm2 == nm and pos in FANTASY_POSITIONS
+        ]
+        if len(fantasy_pids) == 1:
+            name_singletons[nm] = fantasy_pids[0]
+        # else: leave it unresolved — caller will see a miss and log it
+    return by_uid, by_name_pos, name_singletons
 
 
 _NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
@@ -97,13 +124,30 @@ def _normalize_name(name: str) -> str:
     return " ".join(tokens)
 
 
-def _resolve_player(rec: dict, by_uid: dict, by_name: dict) -> int | None:
+def _resolve_player(
+    rec: dict,
+    by_uid: dict,
+    by_name_pos: dict | None = None,
+    by_name: dict | None = None,
+) -> int | None:
+    """Resolution order:
+    1. underdog_id exact match
+    2. (normalized name, position) match
+    3. normalized name alone, only if it's unambiguous after filtering
+       to fantasy-relevant positions
+    """
     uid = rec.get("underdog_id")
     if uid and uid in by_uid:
         return by_uid[uid]
     name = rec.get("full_name")
-    if name:
-        return by_name.get(_normalize_name(name))
+    if not name:
+        return None
+    nm = _normalize_name(name)
+    pos = rec.get("position")
+    if pos and by_name_pos and (nm, pos) in by_name_pos:
+        return by_name_pos[(nm, pos)]
+    if by_name and nm in by_name:
+        return by_name[nm]
     return None
 
 
@@ -154,7 +198,7 @@ def ingest_adp(
                 return 0
 
         records = fetch()
-        by_uid, by_name = _build_lookups(conn)
+        by_uid, by_name_pos, by_name = _build_lookups(conn)
         captured_at = dt.datetime.utcnow().isoformat(timespec="seconds")
 
         snapshots: list[dict] = []
@@ -162,7 +206,7 @@ def ingest_adp(
         backfills: list[tuple[str, int]] = []
 
         for rec in records:
-            pid = _resolve_player(rec, by_uid, by_name)
+            pid = _resolve_player(rec, by_uid, by_name_pos, by_name)
             if pid is None:
                 unmatched.append(rec.get("full_name") or "?")
                 continue

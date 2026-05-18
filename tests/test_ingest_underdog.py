@@ -4,6 +4,7 @@ import pytest
 
 from database import connect, upsert_many
 from ingest_underdog import (
+    _build_lookups,
     _normalize_name,
     _resolve_player,
     fetch_adp_from_file,
@@ -47,19 +48,56 @@ def test_resolve_player_prefers_underdog_id():
     by_uid = {"u1": 100}
     by_name = {"jane doe": 200}
     rec = {"underdog_id": "u1", "full_name": "Jane Doe"}
-    assert _resolve_player(rec, by_uid, by_name) == 100
+    assert _resolve_player(rec, by_uid, {}, by_name) == 100
 
 
 def test_resolve_player_falls_back_to_name():
     by_uid: dict[str, int] = {}
     by_name = {"jane doe": 200}
     rec = {"underdog_id": "u_new", "full_name": "Jane Doe"}
-    assert _resolve_player(rec, by_uid, by_name) == 200
+    assert _resolve_player(rec, by_uid, {}, by_name) == 200
+
+
+def test_resolve_player_uses_position_to_break_ties():
+    # Two players named "Josh Allen" — QB and LB. With position in the
+    # record, we should match the QB; without, name-only fallback might
+    # pick either, so we don't assert on that case here.
+    by_uid: dict[str, int] = {}
+    by_name_pos = {("josh allen", "QB"): 100, ("josh allen", "LB"): 200}
+    by_name: dict = {}  # ambiguous, so collapsed out
+    rec = {"underdog_id": None, "full_name": "Josh Allen", "position": "QB"}
+    assert _resolve_player(rec, by_uid, by_name_pos, by_name) == 100
 
 
 def test_resolve_player_returns_none_on_miss():
     rec = {"underdog_id": None, "full_name": "Nobody"}
-    assert _resolve_player(rec, {}, {}) is None
+    assert _resolve_player(rec, {}, {}, {}) is None
+
+
+def test_build_lookups_prefers_fantasy_position_on_collision(tmp_db):
+    from database import connect, upsert_many
+
+    with connect(tmp_db) as conn:
+        upsert_many(
+            conn,
+            "players",
+            [
+                {"full_name": "Josh Allen", "position": "QB", "gsis_id": "G_QB"},
+                {"full_name": "Josh Allen", "position": "LB", "gsis_id": "G_LB"},
+                {"full_name": "Bijan Robinson", "position": "RB", "gsis_id": "G_BR"},
+            ],
+            conflict_cols=["gsis_id"],
+        )
+        qb_pid = conn.execute(
+            "SELECT player_id FROM players WHERE gsis_id='G_QB'"
+        ).fetchone()[0]
+        by_uid, by_name_pos, by_name = _build_lookups(conn)
+
+    # Name-only lookup must resolve to the QB on a name collision
+    assert by_name["josh allen"] == qb_pid
+    # Name+pos lookup has both entries
+    assert ("josh allen", "QB") in by_name_pos
+    assert ("josh allen", "LB") in by_name_pos
 
 
 def test_ingest_adp_writes_snapshots_and_backfills_underdog_id(tmp_db, tmp_path):
