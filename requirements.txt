@@ -1,0 +1,4 @@
+nfl_data_py>=0.3.3
+pandas>=1.5
+requests>=2.28
+pytest>=7.0
