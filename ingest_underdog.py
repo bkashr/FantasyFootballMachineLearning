@@ -310,6 +310,18 @@ def ingest_adp_from_4for4_csv(
     with connect(db_path) as conn:
         by_uid, by_name_pos, by_name = _build_lookups(conn)
 
+        # Idempotency: pre-load the (player_id, captured_at) pairs we
+        # already have for this source so re-ingesting an overlapping
+        # file is a no-op for the dates that already exist.
+        existing_keys: set[tuple[int, str]] = {
+            (r["player_id"], r["captured_at"])
+            for r in conn.execute(
+                "SELECT player_id, captured_at FROM adp_snapshots WHERE source = ?",
+                (source,),
+            )
+        }
+        skipped_existing = 0
+
         for row in rows:
             name = (row.get("Player") or "").strip()
             position = (row.get("Position") or "").strip() or None
@@ -334,6 +346,9 @@ def ingest_adp_from_4for4_csv(
                     continue
                 if pid is None:
                     unmatched_by_date[ts].append(name)
+                    continue
+                if (pid, ts) in existing_keys:
+                    skipped_existing += 1
                     continue
                 snapshots_by_date[ts].append(
                     {
@@ -366,6 +381,7 @@ def ingest_adp_from_4for4_csv(
 
     summary: dict = {
         "snapshots_written": len(all_snapshots),
+        "skipped_existing": skipped_existing,
         "by_date": {},
     }
     for col, ts in date_columns:
@@ -375,9 +391,10 @@ def ingest_adp_from_4for4_csv(
         }
 
     log.info(
-        "4for4 ingest: %d snapshot rows across %d dates",
+        "4for4 ingest: %d snapshot rows across %d dates (skipped %d already in DB)",
         summary["snapshots_written"],
         len(date_columns),
+        skipped_existing,
     )
     for ts, stats in summary["by_date"].items():
         log.info(

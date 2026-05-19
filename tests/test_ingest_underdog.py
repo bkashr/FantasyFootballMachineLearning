@@ -240,3 +240,54 @@ def test_ingest_4for4_rejects_csv_with_no_date_columns(tmp_db, tmp_path):
     csv_path.write_text('"Rank","Player","Position"\n1,"Bijan","RB"\n')
     with pytest.raises(ValueError, match="No 'ADP on"):
         ingest_adp_from_4for4_csv(csv_path, db_path=tmp_db, year=2026)
+
+
+def test_ingest_4for4_is_idempotent_on_overlap(tmp_db, tmp_path):
+    from database import connect, upsert_many
+
+    with connect(tmp_db) as conn:
+        upsert_many(
+            conn,
+            "players",
+            [{"full_name": "Bijan Robinson", "position": "RB", "gsis_id": "G1"}],
+            conflict_cols=["gsis_id"],
+        )
+
+    csv_path = tmp_path / "Underdog_Draft_Table_20260519.csv"
+    csv_path.write_text(
+        '"Rank","Player","Position","Position Rank","ADP on April 25","ADP on May 19","ADP Change"\n'
+        '1,"Bijan Robinson","RB","RB1",1.5,1.5,0\n'
+    )
+
+    # First ingest: writes 2 rows (Apr 25 + May 19)
+    s1 = ingest_adp_from_4for4_csv(csv_path, db_path=tmp_db)
+    assert s1["snapshots_written"] == 2
+    assert s1["skipped_existing"] == 0
+
+    # Second ingest of same file: nothing new
+    s2 = ingest_adp_from_4for4_csv(csv_path, db_path=tmp_db)
+    assert s2["snapshots_written"] == 0
+    assert s2["skipped_existing"] == 2
+
+    # Now an overlapping file (May 19 + June 3) — only June 3 should be new
+    csv2 = tmp_path / "Underdog_Draft_Table_20260603.csv"
+    csv2.write_text(
+        '"Rank","Player","Position","Position Rank","ADP on May 19","ADP on June 3","ADP Change"\n'
+        '1,"Bijan Robinson","RB","RB1",1.5,1.4,-0.1\n'
+    )
+    s3 = ingest_adp_from_4for4_csv(csv2, db_path=tmp_db)
+    assert s3["snapshots_written"] == 1
+    assert s3["skipped_existing"] == 1
+
+    with connect(tmp_db) as conn:
+        dates = [
+            r["captured_at"]
+            for r in conn.execute(
+                "SELECT DISTINCT captured_at FROM adp_snapshots ORDER BY captured_at"
+            )
+        ]
+    assert dates == [
+        "2026-04-25T00:00:00",
+        "2026-05-19T00:00:00",
+        "2026-06-03T00:00:00",
+    ]
