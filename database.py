@@ -176,6 +176,36 @@ def init_db(db_path: str = DB_PATH):
         PRIMARY KEY (player_id, season, model_version),
         FOREIGN KEY (player_id) REFERENCES players(player_id)
     );
+
+    -- Portfolio (Phase 5): the user's actual best-ball drafts and picks.
+    -- One row in my_drafts per draft entered; one row in my_picks per
+    -- selection made. Feeds exposure-aware scoring and stack analysis.
+    CREATE TABLE IF NOT EXISTS my_drafts (
+        draft_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        underdog_draft_id TEXT UNIQUE,
+        draft_name        TEXT,
+        draft_format      TEXT NOT NULL DEFAULT 'best_ball',
+        season            INTEGER NOT NULL,
+        teams             INTEGER NOT NULL DEFAULT 12,
+        rounds            INTEGER NOT NULL DEFAULT 18,
+        my_slot           INTEGER,
+        entry_fee         REAL,
+        drafted_at        TEXT,
+        status            TEXT DEFAULT 'active'
+    );
+
+    CREATE TABLE IF NOT EXISTS my_picks (
+        pick_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        draft_id     INTEGER NOT NULL,
+        player_id    INTEGER NOT NULL,
+        round        INTEGER NOT NULL,
+        pick_overall INTEGER NOT NULL,
+        FOREIGN KEY (draft_id) REFERENCES my_drafts(draft_id),
+        FOREIGN KEY (player_id) REFERENCES players(player_id),
+        UNIQUE (draft_id, pick_overall)
+    );
+    CREATE INDEX IF NOT EXISTS idx_my_picks_player ON my_picks(player_id);
+    CREATE INDEX IF NOT EXISTS idx_my_picks_draft ON my_picks(draft_id);
     """)
 
     conn.commit()
