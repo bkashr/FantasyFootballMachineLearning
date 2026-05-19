@@ -5,10 +5,13 @@ import pytest
 from database import connect, upsert_many
 from ingest_underdog import (
     _build_lookups,
+    _infer_year_from_filename,
     _normalize_name,
+    _parse_adp_date_label,
     _resolve_player,
     fetch_adp_from_file,
     ingest_adp,
+    ingest_adp_from_4for4_csv,
     normalize_adp_response,
 )
 
@@ -165,3 +168,75 @@ def test_ingest_adp_respects_min_age_hours(tmp_db, tmp_path):
         )
         == 0
     )
+
+
+def test_parse_adp_date_label_handles_month_day():
+    assert _parse_adp_date_label("April 25", 2026) == "2026-04-25T00:00:00"
+    assert _parse_adp_date_label("May 19", 2026) == "2026-05-19T00:00:00"
+    assert _parse_adp_date_label("December 1", 2024) == "2024-12-01T00:00:00"
+
+
+def test_parse_adp_date_label_rejects_bad_input():
+    import pytest
+    with pytest.raises(ValueError):
+        _parse_adp_date_label("Smarch 7", 2026)
+    with pytest.raises(ValueError):
+        _parse_adp_date_label("garbage", 2026)
+
+
+def test_infer_year_from_filename():
+    from pathlib import Path
+    assert _infer_year_from_filename(Path("Underdog_Draft_Table_20260519.csv")) == 2026
+    assert _infer_year_from_filename(Path("foo_20240801_bar.csv")) == 2024
+    assert _infer_year_from_filename(Path("no_date_here.csv")) is None
+
+
+def test_ingest_4for4_creates_one_snapshot_per_date_column(tmp_db, tmp_path):
+    from database import connect, upsert_many
+
+    # Seed two players matching by (name, position)
+    with connect(tmp_db) as conn:
+        upsert_many(
+            conn,
+            "players",
+            [
+                {"full_name": "Bijan Robinson", "position": "RB", "gsis_id": "G1"},
+                {"full_name": "Ja'Marr Chase",  "position": "WR", "gsis_id": "G2"},
+            ],
+            conflict_cols=["gsis_id"],
+        )
+
+    csv_path = tmp_path / "Underdog_Draft_Table_20260519.csv"
+    csv_path.write_text(
+        '"Rank","Player","Position","Position Rank","ADP on April 25","ADP on May 19","ADP Change"\n'
+        '1,"Bijan Robinson","RB","RB1",1.5,1.5,0\n'
+        '2,"Ja\'Marr Chase","WR","WR1",3.1,3.0,-0.1\n'
+        '500,"Tail Guy","WR","WR99",215.5,216,0.5\n'   # undrafted sentinel -> filtered
+    )
+    summary = ingest_adp_from_4for4_csv(csv_path, db_path=tmp_db)
+
+    # Two date columns, two real players => 4 snapshots written
+    assert summary["snapshots_written"] == 4
+    assert summary["by_date"]["2026-04-25T00:00:00"]["written"] == 2
+    assert summary["by_date"]["2026-05-19T00:00:00"]["written"] == 2
+
+    with connect(tmp_db) as conn:
+        # Tail Guy never made it in (filtered + unmatched, both reasons)
+        rows = list(conn.execute(
+            "SELECT captured_at, source, adp, adp_rank FROM adp_snapshots "
+            "ORDER BY captured_at, adp"
+        ))
+    assert len(rows) == 4
+    # adp_rank derived from sort within each snapshot
+    assert rows[0]["adp_rank"] == 1
+    assert rows[1]["adp_rank"] == 2
+    # All rows tagged with the 4for4 source
+    assert all(r["source"] == "4for4_underdog" for r in rows)
+
+
+def test_ingest_4for4_rejects_csv_with_no_date_columns(tmp_db, tmp_path):
+    import pytest
+    csv_path = tmp_path / "no_dates.csv"
+    csv_path.write_text('"Rank","Player","Position"\n1,"Bijan","RB"\n')
+    with pytest.raises(ValueError, match="No 'ADP on"):
+        ingest_adp_from_4for4_csv(csv_path, db_path=tmp_db, year=2026)

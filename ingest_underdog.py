@@ -17,6 +17,7 @@ import csv
 import datetime as dt
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -231,6 +232,158 @@ def ingest_underdog_projections(
         unmatched,
     )
     return len(rows)
+
+
+_4FOR4_DATE_COL_RE = re.compile(r"^ADP on (.+)$")
+_FILENAME_DATE_RE = re.compile(r"(\d{8})")
+_MONTH_NAMES = {
+    name: i for i, name in enumerate(
+        [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ],
+        start=1,
+    )
+}
+
+
+def _infer_year_from_filename(path: Path) -> int | None:
+    """Pull the year from a filename like 'Underdog_Draft_Table_20260519.csv'."""
+    m = _FILENAME_DATE_RE.search(path.name)
+    if m:
+        return int(m.group(1)[:4])
+    return None
+
+
+def _parse_adp_date_label(label: str, year: int) -> str:
+    """'April 25' + 2026 -> '2026-04-25T00:00:00'."""
+    parts = label.strip().split()
+    if len(parts) != 2:
+        raise ValueError(f"Can't parse 4for4 date label: {label!r}")
+    month_name, day = parts
+    month = _MONTH_NAMES.get(month_name)
+    if month is None:
+        raise ValueError(f"Unknown month in 4for4 date label: {month_name!r}")
+    return f"{year:04d}-{month:02d}-{int(day):02d}T00:00:00"
+
+
+def ingest_adp_from_4for4_csv(
+    path: str | Path,
+    year: int | None = None,
+    draft_format: str = "best_ball",
+    source: str = "4for4_underdog",
+    skip_undrafted_threshold: float = 215.0,
+    db_path: str = DB_PATH,
+) -> dict:
+    """Parse 4for4's Underdog ADP CSV. Each 'ADP on <date>' column
+    becomes its own snapshot in adp_snapshots, so a single download
+    can backfill multiple historical points.
+
+    Args:
+      year: year for the 'Month Day' date labels. Inferred from the
+            filename's YYYYMMDD if present; otherwise defaults to now.
+      skip_undrafted_threshold: 4for4 caps undrafted players at ~216;
+            drop those — they're not real ADP, just position-holders.
+    """
+    init_db(db_path)
+    path = Path(path)
+    if year is None:
+        year = _infer_year_from_filename(path) or dt.datetime.utcnow().year
+
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        date_columns: list[tuple[str, str]] = []
+        for col in fieldnames:
+            m = _4FOR4_DATE_COL_RE.match(col)
+            if m:
+                date_columns.append((col, _parse_adp_date_label(m.group(1), year)))
+        if not date_columns:
+            raise ValueError(
+                f"No 'ADP on <date>' columns in 4for4 CSV. Got: {fieldnames}"
+            )
+        rows = list(reader)
+
+    snapshots_by_date: dict[str, list[dict]] = {ts: [] for _, ts in date_columns}
+    unmatched_by_date: dict[str, list[str]] = {ts: [] for _, ts in date_columns}
+
+    with connect(db_path) as conn:
+        by_uid, by_name_pos, by_name = _build_lookups(conn)
+
+        for row in rows:
+            name = (row.get("Player") or "").strip()
+            position = (row.get("Position") or "").strip() or None
+            if not name:
+                continue
+            rec = {
+                "underdog_id": None,
+                "full_name": name,
+                "position": position,
+            }
+            pid = _resolve_player(rec, by_uid, by_name_pos, by_name)
+
+            for col, ts in date_columns:
+                raw = (row.get(col) or "").strip()
+                if not raw:
+                    continue
+                try:
+                    adp = float(raw)
+                except ValueError:
+                    continue
+                if adp >= skip_undrafted_threshold:
+                    continue
+                if pid is None:
+                    unmatched_by_date[ts].append(name)
+                    continue
+                snapshots_by_date[ts].append(
+                    {
+                        "player_id": pid,
+                        "adp": adp,
+                        "adp_rank": None,
+                        "draft_format": draft_format,
+                        "source": source,
+                        "captured_at": ts,
+                    }
+                )
+
+        # Derive per-snapshot adp_rank from sorting ADP ascending.
+        for batch in snapshots_by_date.values():
+            batch.sort(key=lambda s: s["adp"])
+            for i, snap in enumerate(batch, start=1):
+                snap["adp_rank"] = i
+
+        all_snapshots = [s for batch in snapshots_by_date.values() for s in batch]
+        if all_snapshots:
+            cols = [
+                "player_id", "adp", "adp_rank",
+                "draft_format", "source", "captured_at",
+            ]
+            conn.executemany(
+                f"INSERT INTO adp_snapshots ({','.join(cols)}) "
+                f"VALUES ({','.join(['?'] * len(cols))})",
+                [[s[c] for c in cols] for s in all_snapshots],
+            )
+
+    summary: dict = {
+        "snapshots_written": len(all_snapshots),
+        "by_date": {},
+    }
+    for col, ts in date_columns:
+        summary["by_date"][ts] = {
+            "written": len(snapshots_by_date[ts]),
+            "unmatched": len(unmatched_by_date[ts]),
+        }
+
+    log.info(
+        "4for4 ingest: %d snapshot rows across %d dates",
+        summary["snapshots_written"],
+        len(date_columns),
+    )
+    for ts, stats in summary["by_date"].items():
+        log.info(
+            "  %s: %d written, %d unmatched", ts, stats["written"], stats["unmatched"]
+        )
+    return summary
 
 
 def normalize_adp_response(raw: dict) -> list[dict]:
@@ -467,6 +620,18 @@ def main():
         "Populates both adp_snapshots and player_projections (source='underdog').",
     )
     p.add_argument(
+        "--from-4for4-csv",
+        help="Path to 4for4's Underdog Draft Table CSV. Each 'ADP on <date>' "
+        "column becomes its own snapshot in adp_snapshots (source='4for4_underdog').",
+    )
+    p.add_argument(
+        "--year",
+        type=int,
+        default=None,
+        help="Year for 4for4's 'Month Day' date labels. Inferred from filename "
+        "(YYYYMMDD) when not provided.",
+    )
+    p.add_argument(
         "--from-file",
         help="Path to a JSON file of pre-normalized records (see fetch_adp_from_file). "
         "Useful for fixture-driven tests.",
@@ -513,6 +678,13 @@ def main():
             ingest_underdog_projections(
                 records, season=args.season, db_path=args.db
             )
+    elif args.from_4for4_csv:
+        ingest_adp_from_4for4_csv(
+            args.from_4for4_csv,
+            year=args.year,
+            draft_format=args.draft_format,
+            db_path=args.db,
+        )
     elif args.from_file:
         ingest_adp(
             fetch=lambda: fetch_adp_from_file(args.from_file),
