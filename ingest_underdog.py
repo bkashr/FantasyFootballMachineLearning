@@ -13,6 +13,7 @@ PLANNING.md flags as inevitable for new rookies and name collisions."""
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import json
 import logging
@@ -23,16 +24,63 @@ from database import DB_PATH, connect, init_db
 
 log = logging.getLogger(__name__)
 
-UNDERDOG_ADP_URL = "https://api.underdogfantasy.com/v1/over_under_lines"  # PLACEHOLDER — confirm via devtools recon
+# Underdog's CSV download endpoint. Path is
+# /rankings/download/{slate_id}/{?}/{contest_style_id}?product=fantasy&...
+# Behind Cloudflare; easier to download via the web "Download" button
+# and feed the file through --from-underdog-csv than to replay the HTTP
+# call from Python.
+UNDERDOG_RANKINGS_DOWNLOAD = (
+    "https://app.underdogsports.com/rankings/download/{slate_id}/{x}/{contest_style_id}"
+)
+
+# Map Underdog's full team names to nflverse's 3-letter abbreviations
+# so the crosswalk lines up across sources. nflverse uses the standard
+# NFL.com abbrs: LAR / LAC / LV / WAS / JAX, etc.
+TEAM_NAME_TO_ABBR = {
+    "Arizona Cardinals": "ARI",
+    "Atlanta Falcons": "ATL",
+    "Baltimore Ravens": "BAL",
+    "Buffalo Bills": "BUF",
+    "Carolina Panthers": "CAR",
+    "Chicago Bears": "CHI",
+    "Cincinnati Bengals": "CIN",
+    "Cleveland Browns": "CLE",
+    "Dallas Cowboys": "DAL",
+    "Denver Broncos": "DEN",
+    "Detroit Lions": "DET",
+    "Green Bay Packers": "GB",
+    "Houston Texans": "HOU",
+    "Indianapolis Colts": "IND",
+    "Jacksonville Jaguars": "JAX",
+    "Kansas City Chiefs": "KC",
+    "Las Vegas Raiders": "LV",
+    "Los Angeles Chargers": "LAC",
+    "Los Angeles Rams": "LA",
+    "Miami Dolphins": "MIA",
+    "Minnesota Vikings": "MIN",
+    "New England Patriots": "NE",
+    "New Orleans Saints": "NO",
+    "New York Giants": "NYG",
+    "New York Jets": "NYJ",
+    "Philadelphia Eagles": "PHI",
+    "Pittsburgh Steelers": "PIT",
+    "San Francisco 49ers": "SF",
+    "Seattle Seahawks": "SEA",
+    "Tampa Bay Buccaneers": "TB",
+    "Tennessee Titans": "TEN",
+    "Washington Commanders": "WAS",
+}
 
 
 def fetch_adp_from_underdog(draft_format: str = "best_ball") -> list[dict]:
-    """Real HTTP fetcher. Not wired up yet — recon Underdog's network
-    calls (see PLANNING.md step 1) to fill in the URL, headers, and
-    response parsing. Until then this raises so we don't silently no-op."""
+    """Live HTTP fetcher. Underdog's rankings page is behind Cloudflare
+    bot protection and uses a 10-min JWT, so direct replay from Python
+    is fragile. Use the CSV download path instead — see
+    `fetch_adp_from_underdog_csv`."""
     raise NotImplementedError(
-        "Underdog ADP endpoint not yet identified. Do the devtools recon "
-        "in PLANNING.md step 1 and wire it up here."
+        "Live HTTP fetch is fragile due to Cloudflare + 10-min JWT. "
+        "Download the rankings CSV from Underdog and use "
+        "fetch_adp_from_underdog_csv() instead."
     )
 
 
@@ -41,6 +89,148 @@ def fetch_adp_from_file(path: str | Path) -> list[dict]:
     `normalize_adp_response` so we can exercise the pipeline before the
     real endpoint is known."""
     return json.loads(Path(path).read_text())
+
+
+def fetch_adp_from_underdog_csv(
+    path: str | Path,
+    draft_format: str = "best_ball",
+) -> list[dict]:
+    """Parse Underdog's rankings CSV download.
+
+    Expected header (as of May 2026):
+        id, firstName, lastName, adp, projectedPoints, salary,
+        positionRank, slotName, teamName, lineupStatus, byeWeek
+
+    Returns normalized records with both ADP and projection fields so
+    the same pass can populate adp_snapshots and player_projections."""
+    required = {"id", "firstName", "lastName", "adp", "slotName", "teamName"}
+    out: list[dict] = []
+    with Path(path).open(newline="") as f:
+        reader = csv.DictReader(f)
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                f"Underdog CSV missing expected columns: {sorted(missing)}. "
+                f"Got: {reader.fieldnames}"
+            )
+        # rank from the CSV's natural sort order (rows are returned
+        # ordered by ADP ascending — Bijan at 1.5 first, Gibbs at 1.6
+        # second, etc.)
+        for rank, row in enumerate(reader, start=1):
+            adp_raw = row.get("adp")
+            if not adp_raw:
+                continue
+            try:
+                adp = float(adp_raw)
+            except ValueError:
+                continue
+            team_full = (row.get("teamName") or "").strip()
+            out.append(
+                {
+                    "underdog_id": (row.get("id") or "").strip() or None,
+                    "full_name": f"{row.get('firstName','').strip()} "
+                                 f"{row.get('lastName','').strip()}".strip(),
+                    "position": (row.get("slotName") or "").strip() or None,
+                    "team": TEAM_NAME_TO_ABBR.get(team_full, team_full),
+                    "adp": adp,
+                    "adp_rank": rank,
+                    "draft_format": draft_format,
+                    # Bonus projection field — ingest_adp ignores it,
+                    # ingest_underdog_projections picks it up.
+                    "projected_points_ppr": _maybe_float(
+                        row.get("projectedPoints")
+                    ),
+                    "position_rank": (row.get("positionRank") or "").strip()
+                    or None,
+                    "bye_week": _maybe_int(row.get("byeWeek")),
+                }
+            )
+    return out
+
+
+def _maybe_float(s: str | None) -> float | None:
+    if s is None or s == "":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _maybe_int(s: str | None) -> int | None:
+    if s is None or s == "":
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def ingest_underdog_projections(
+    records: list[dict],
+    source: str = "underdog",
+    season: int | None = None,
+    db_path: str = DB_PATH,
+) -> int:
+    """Write Underdog's projectedPoints column into player_projections.
+    Same crosswalk as ingest_adp — match by underdog_id, then by
+    (name, position), then name alone.
+
+    `season` defaults to the next NFL season relative to today; pass
+    explicitly if the CSV is for a different one."""
+    init_db(db_path)
+    if season is None:
+        today = dt.date.today()
+        season = today.year if today.month >= 3 else today.year - 1
+
+    captured_at = dt.datetime.utcnow().isoformat(timespec="seconds")
+
+    with connect(db_path) as conn:
+        by_uid, by_name_pos, by_name = _build_lookups(conn)
+
+        rows: list[dict] = []
+        unmatched = 0
+        for rec in records:
+            proj = rec.get("projected_points_ppr")
+            if proj is None:
+                continue
+            pid = _resolve_player(rec, by_uid, by_name_pos, by_name)
+            if pid is None:
+                unmatched += 1
+                continue
+            rows.append(
+                {
+                    "player_id": pid,
+                    "season": season,
+                    "source": source,
+                    "projected_points_ppr": float(proj),
+                    "projected_points": float(proj) * 0.75,
+                    "captured_at": captured_at,
+                }
+            )
+
+        if rows:
+            cols = list(rows[0].keys())
+            conn.executemany(
+                f"""
+                INSERT INTO player_projections ({','.join(cols)})
+                VALUES ({','.join(['?'] * len(cols))})
+                ON CONFLICT(player_id, season, source) DO UPDATE SET
+                  projected_points_ppr = excluded.projected_points_ppr,
+                  projected_points = excluded.projected_points,
+                  captured_at = excluded.captured_at
+                """,
+                [[r[c] for c in cols] for r in rows],
+            )
+
+    log.info(
+        "Wrote %d Underdog projections (season=%d, source=%s); %d unmatched",
+        len(rows),
+        season,
+        source,
+        unmatched,
+    )
+    return len(rows)
 
 
 def normalize_adp_response(raw: dict) -> list[dict]:
@@ -272,9 +462,14 @@ def normalize_adp_response_from_live(draft_format: str) -> list[dict]:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
+        "--from-underdog-csv",
+        help="Path to the rankings CSV downloaded from Underdog's web app. "
+        "Populates both adp_snapshots and player_projections (source='underdog').",
+    )
+    p.add_argument(
         "--from-file",
         help="Path to a JSON file of pre-normalized records (see fetch_adp_from_file). "
-        "Useful before the live endpoint is wired up.",
+        "Useful for fixture-driven tests.",
     )
     p.add_argument("--draft-format", default="best_ball")
     p.add_argument(
@@ -282,6 +477,18 @@ def main():
         type=float,
         default=0.0,
         help="Skip if last snapshot is younger than this many hours.",
+    )
+    p.add_argument(
+        "--season",
+        type=int,
+        default=None,
+        help="Season tag for projections (defaults to current/next NFL season).",
+    )
+    p.add_argument(
+        "--no-projections",
+        action="store_true",
+        help="With --from-underdog-csv, skip writing the projectedPoints "
+        "column to player_projections.",
     )
     p.add_argument("--db", default=DB_PATH)
     p.add_argument("-v", "--verbose", action="store_true")
@@ -292,17 +499,36 @@ def main():
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    if args.from_file:
-        fetch = lambda: fetch_adp_from_file(args.from_file)
+    if args.from_underdog_csv:
+        records = fetch_adp_from_underdog_csv(
+            args.from_underdog_csv, draft_format=args.draft_format
+        )
+        ingest_adp(
+            fetch=lambda: records,
+            draft_format=args.draft_format,
+            min_age_hours=args.min_age_hours,
+            db_path=args.db,
+        )
+        if not args.no_projections:
+            ingest_underdog_projections(
+                records, season=args.season, db_path=args.db
+            )
+    elif args.from_file:
+        ingest_adp(
+            fetch=lambda: fetch_adp_from_file(args.from_file),
+            draft_format=args.draft_format,
+            min_age_hours=args.min_age_hours,
+            db_path=args.db,
+        )
     else:
-        fetch = None  # uses the live (not-yet-implemented) fetcher
-
-    ingest_adp(
-        fetch=fetch,
-        draft_format=args.draft_format,
-        min_age_hours=args.min_age_hours,
-        db_path=args.db,
-    )
+        # Falls through to the live HTTP fetcher, which raises a clear
+        # NotImplementedError pointing back to the CSV path.
+        ingest_adp(
+            fetch=None,
+            draft_format=args.draft_format,
+            min_age_hours=args.min_age_hours,
+            db_path=args.db,
+        )
 
 
 if __name__ == "__main__":
