@@ -46,12 +46,14 @@ def init_db(db_path: str = DB_PATH):
     );
 
     -- Append-only ADP snapshots. One row per (player, pull). Keep the full
-    -- history so we can see how ADP moved over time.
+    -- history so we can see how ADP moved over time. position_rank is the
+    -- intra-position rank (e.g. RB15) — different from adp_rank (overall).
     CREATE TABLE IF NOT EXISTS adp_snapshots (
         snapshot_id   INTEGER PRIMARY KEY AUTOINCREMENT,
         player_id     INTEGER NOT NULL,
         adp           REAL NOT NULL,
         adp_rank      INTEGER,
+        position_rank INTEGER,
         draft_format  TEXT,
         source        TEXT NOT NULL DEFAULT 'underdog',
         captured_at   TEXT NOT NULL,

@@ -158,6 +158,14 @@ def _maybe_float(s: str | None) -> float | None:
         return None
 
 
+def _parse_position_rank(s: str | None) -> int | None:
+    """Extract the integer from a label like 'RB15' or 'WR1'."""
+    if not s:
+        return None
+    digits = "".join(c for c in s if c.isdigit())
+    return int(digits) if digits else None
+
+
 def _maybe_int(s: str | None) -> int | None:
     if s is None or s == "":
         return None
@@ -325,6 +333,7 @@ def ingest_adp_from_4for4_csv(
         for row in rows:
             name = (row.get("Player") or "").strip()
             position = (row.get("Position") or "").strip() or None
+            pos_rank = _parse_position_rank(row.get("Position Rank"))
             if not name:
                 continue
             rec = {
@@ -355,6 +364,7 @@ def ingest_adp_from_4for4_csv(
                         "player_id": pid,
                         "adp": adp,
                         "adp_rank": None,
+                        "position_rank": pos_rank,
                         "draft_format": draft_format,
                         "source": source,
                         "captured_at": ts,
@@ -370,7 +380,7 @@ def ingest_adp_from_4for4_csv(
         all_snapshots = [s for batch in snapshots_by_date.values() for s in batch]
         if all_snapshots:
             cols = [
-                "player_id", "adp", "adp_rank",
+                "player_id", "adp", "adp_rank", "position_rank",
                 "draft_format", "source", "captured_at",
             ]
             conn.executemany(
@@ -577,6 +587,9 @@ def ingest_adp(
                     "player_id": pid,
                     "adp": float(rec["adp"]),
                     "adp_rank": rec.get("adp_rank"),
+                    "position_rank": _parse_position_rank(
+                        rec.get("position_rank")
+                    ),
                     "draft_format": rec.get("draft_format") or draft_format,
                     "source": "underdog",
                     "captured_at": captured_at,
@@ -596,6 +609,7 @@ def ingest_adp(
                 "player_id",
                 "adp",
                 "adp_rank",
+                "position_rank",
                 "draft_format",
                 "source",
                 "captured_at",

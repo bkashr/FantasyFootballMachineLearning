@@ -109,9 +109,40 @@ def ingest_rosters(seasons: list[int], db_path: str = DB_PATH) -> int:
     )
 
     with connect(db_path) as conn:
+        _null_against_existing_source_ids(
+            conn, rows, columns=("sleeper_id", "pfr_id", "espn_id")
+        )
         upsert_many(conn, "players", rows, conflict_cols=["gsis_id"])
     log.info("Upserted %d players", len(rows))
     return len(rows)
+
+
+def _null_against_existing_source_ids(
+    conn, rows: list[dict], columns: tuple[str, ...]
+) -> None:
+    """For source-ID columns with UNIQUE constraints, null out new-row
+    values that already exist in the DB under a DIFFERENT gsis_id. This
+    handles cross-batch collisions — e.g. ingesting 2024 rosters when
+    the same espn_id is already attached to a different player from
+    an earlier season."""
+    for col in columns:
+        existing = {
+            r[col]: r["gsis_id"]
+            for r in conn.execute(
+                f"SELECT {col}, gsis_id FROM players WHERE {col} IS NOT NULL"
+            )
+        }
+        for row in rows:
+            v = row.get(col)
+            if v is None or v == "":
+                continue
+            owner = existing.get(v)
+            if owner and owner != row.get("gsis_id"):
+                log.warning(
+                    "Existing %s=%r is held by gsis_id=%r; nulling for new gsis_id=%r",
+                    col, v, owner, row.get("gsis_id"),
+                )
+                row[col] = None
 
 
 def _null_duplicate_source_ids(

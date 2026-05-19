@@ -60,6 +60,137 @@ def _projection_from_prior_season(conn, season: int) -> dict[int, float]:
     return {r["player_id"]: float(r["fantasy_points_ppr"]) for r in rows}
 
 
+FANTASY_POSITIONS = ("QB", "RB", "WR", "TE")
+
+
+def _latest_completed_season(conn) -> int | None:
+    """Most recent season we actually have stats for. Used as the basis
+    for synthetic curves when the requested season hasn't been played."""
+    row = conn.execute(
+        "SELECT MAX(season) AS s FROM player_season_stats "
+        "WHERE fantasy_points_ppr IS NOT NULL"
+    ).fetchone()
+    return row["s"] if row and row["s"] is not None else None
+
+
+def _latest_position_rank(conn, draft_format: str = "best_ball"):
+    """Return {player_id: (position_rank, position)} for the freshest
+    snapshot per player. position comes from players.position so we
+    can group correctly even if the source doesn't repeat it."""
+    rows = conn.execute(
+        """
+        SELECT a.player_id, a.position_rank, p.position
+        FROM adp_snapshots a
+        JOIN players p USING (player_id)
+        JOIN (
+            SELECT player_id, MAX(captured_at) AS ts
+            FROM adp_snapshots
+            WHERE draft_format = ?
+            GROUP BY player_id
+        ) latest ON latest.player_id = a.player_id AND latest.ts = a.captured_at
+        WHERE a.draft_format = ? AND a.position_rank IS NOT NULL
+        """,
+        (draft_format, draft_format),
+    ).fetchall()
+    return {
+        r["player_id"]: (r["position_rank"], r["position"])
+        for r in rows
+        if r["position"] in FANTASY_POSITIONS
+    }
+
+
+def build_value_curve_by_position(
+    conn,
+    seasons: list[int],
+    draft_format: str = "best_ball",
+    bucket_size: int = 3,
+) -> dict[str, dict[int, float]]:
+    """Per-position curves from historical ADP joined to outcomes.
+
+    Returns {position: {bucket: expected_ppr}}. Like build_value_curve
+    but bucketed on position_rank within each position — so TE15 isn't
+    compared to a pool of overall ADP 100 players, it's compared to
+    other TEs that finished around TE15."""
+    by_pos: dict[str, dict[int, list[float]]] = {}
+    for season in seasons:
+        lo = f"{season}-01-01T00:00:00"
+        hi = f"{season}-09-15T00:00:00"
+        rows = conn.execute(
+            """
+            SELECT p.position, a.position_rank, s.fantasy_points_ppr
+            FROM adp_snapshots a
+            JOIN player_season_stats s
+              ON s.player_id = a.player_id AND s.season = ?
+            JOIN players p ON p.player_id = a.player_id
+            WHERE a.draft_format = ?
+              AND a.position_rank IS NOT NULL
+              AND s.fantasy_points_ppr IS NOT NULL
+              AND a.captured_at >= ? AND a.captured_at < ?
+            """,
+            (season, draft_format, lo, hi),
+        ).fetchall()
+        for r in rows:
+            if r["position"] not in FANTASY_POSITIONS:
+                continue
+            bucket = (r["position_rank"] - 1) // bucket_size
+            by_pos.setdefault(r["position"], {}).setdefault(bucket, []).append(
+                float(r["fantasy_points_ppr"])
+            )
+    return {
+        pos: {b: sum(v) / len(v) for b, v in buckets.items()}
+        for pos, buckets in by_pos.items()
+    }
+
+
+def _synthetic_curve_by_position(
+    conn, season: int, bucket_size: int = 3
+) -> dict[str, dict[int, float]]:
+    """Stand-in per-position curve before we have multi-year historical
+    ADP. Ranks last season's PPR finishers within each position and
+    buckets them. Answers 'what does the Nth-best QB / RB / WR / TE
+    typically score?'"""
+    rows = conn.execute(
+        """
+        SELECT p.position, s.fantasy_points_ppr
+        FROM player_season_stats s
+        JOIN players p USING (player_id)
+        WHERE s.season = ? AND s.fantasy_points_ppr IS NOT NULL
+          AND p.position IN ('QB','RB','WR','TE')
+        ORDER BY s.fantasy_points_ppr DESC
+        """,
+        (season,),
+    ).fetchall()
+    by_pos: dict[str, list[float]] = {}
+    for r in rows:
+        by_pos.setdefault(r["position"], []).append(float(r["fantasy_points_ppr"]))
+    curves: dict[str, dict[int, float]] = {}
+    for pos, ppr_list in by_pos.items():
+        buckets: dict[int, list[float]] = {}
+        for i, ppr in enumerate(ppr_list):
+            b = i // bucket_size
+            buckets.setdefault(b, []).append(ppr)
+        curves[pos] = {b: sum(v) / len(v) for b, v in buckets.items()}
+    return curves
+
+
+def _expected_for_position_rank(
+    position: str | None,
+    rank: int | None,
+    curves: dict[str, dict[int, float]],
+    bucket_size: int,
+) -> float | None:
+    if position is None or rank is None or not curves:
+        return None
+    curve = curves.get(position)
+    if not curve:
+        return None
+    bucket = (rank - 1) // bucket_size
+    if bucket in curve:
+        return curve[bucket]
+    max_bucket = max(curve)
+    return curve[max_bucket] if bucket > max_bucket else None
+
+
 def _projection_from_table(conn, season: int, source: str) -> dict[int, float]:
     """Read projections from player_projections. Source tag picks the
     model — 'internal_v2' is the Phase-2 projection."""
@@ -162,15 +293,19 @@ def score_players(
     bucket_size: int = 6,
     db_path: str = DB_PATH,
     curve: dict[int, float] | None = None,
+    curves_by_position: dict[str, dict[int, float]] | None = None,
+    position_aware: bool = False,
     projection_source: str | None = None,
 ) -> int:
     """Compute and store scores for `season`. Returns rows written.
 
-    `curve` lets callers inject a pre-built value curve (rank-bucket ->
-    expected PPR). Useful for tests and for plugging in a better curve
-    once we have proper historical ADP. If None, we try a real curve
-    from prior-season ADP and fall back to a synthetic curve derived
-    from prior-season PPR finish.
+    `curve` (flat) or `curves_by_position` lets callers inject a
+    pre-built value curve. If position_aware=True (or curves_by_position
+    is passed), we compute expected PPR per position from position_rank
+    instead of overall adp_rank.
+
+    Without an injected curve, we try a real historical curve and fall
+    back to a synthetic curve from prior-season PPR rank.
 
     `projection_source`: if set, pull projections from
     player_projections WHERE source = projection_source (e.g.
@@ -178,6 +313,7 @@ def score_players(
     PPR directly — that's the baseline_v1 behavior.
     """
     init_db(db_path)
+    use_position_aware = position_aware or curves_by_position is not None
     with connect(db_path) as conn:
         if projection_source:
             projections = _projection_from_table(conn, season, projection_source)
@@ -188,32 +324,61 @@ def score_players(
             )
         else:
             projections = _projection_from_prior_season(conn, season)
-        adp = _latest_adp(conn, draft_format=draft_format)
 
-        if curve is None:
-            curve = build_value_curve(
-                conn,
-                seasons=[season - 1],
-                draft_format=draft_format,
-                bucket_size=bucket_size,
-            )
-            if not curve:
-                log.info(
-                    "No historical ADP yet — using synthetic curve from prior PPR ranks"
+        # For synthetic curves we use the latest season that actually has
+        # stats — falling back to season-1 only if we have its data.
+        synth_season = _latest_completed_season(conn) or (season - 1)
+
+        if use_position_aware:
+            pos_lookup = _latest_position_rank(conn, draft_format=draft_format)
+            if curves_by_position is None:
+                curves_by_position = build_value_curve_by_position(
+                    conn,
+                    seasons=[season - 1],
+                    draft_format=draft_format,
+                    bucket_size=bucket_size,
                 )
-                curve = _synthetic_curve_from_ppr_rank(
-                    conn, season - 1, bucket_size=bucket_size
+                if not curves_by_position:
+                    log.info(
+                        "No historical position ADP yet — synthetic per-position curve from %d",
+                        synth_season,
+                    )
+                    curves_by_position = _synthetic_curve_by_position(
+                        conn, synth_season, bucket_size=bucket_size
+                    )
+        else:
+            adp = _latest_adp(conn, draft_format=draft_format)
+            if curve is None:
+                curve = build_value_curve(
+                    conn,
+                    seasons=[season - 1],
+                    draft_format=draft_format,
+                    bucket_size=bucket_size,
                 )
+                if not curve:
+                    log.info(
+                        "No historical ADP yet — synthetic curve from %d PPR ranks",
+                        synth_season,
+                    )
+                    curve = _synthetic_curve_from_ppr_rank(
+                        conn, synth_season, bucket_size=bucket_size
+                    )
 
         computed_at = dt.datetime.utcnow().isoformat(timespec="seconds")
         rows = []
         skipped_no_adp = 0
         for player_id, proj in projections.items():
-            adp_rank = adp.get(player_id, (None, None))[1]
-            expected = _expected_for_rank(adp_rank, curve, bucket_size)
+            if use_position_aware:
+                pos_rank, position = pos_lookup.get(player_id, (None, None))
+                expected = _expected_for_position_rank(
+                    position, pos_rank, curves_by_position, bucket_size
+                )
+            else:
+                adp_rank = adp.get(player_id, (None, None))[1]
+                expected = _expected_for_rank(adp_rank, curve, bucket_size)
             if expected is None:
-                # No ADP or off the curve — score = projection - expected is
-                # undefined. Skip rather than reporting a misleading number.
+                # No ADP or off the curve — score = projection - expected
+                # is undefined. Skip rather than reporting a misleading number.
                 skipped_no_adp += 1
                 continue
             rows.append(
@@ -313,6 +478,13 @@ def main():
         help="Read projections from player_projections WHERE source=<this>. "
         "If omitted, falls back to prior-season PPR (baseline_v1).",
     )
+    p.add_argument(
+        "--position-aware",
+        action="store_true",
+        help="Use per-position value curves (TE15 vs WR15 vs QB15) instead "
+        "of one overall ADP curve. Requires position_rank in adp_snapshots.",
+    )
+    p.add_argument("--bucket-size", type=int, default=6, help="Curve bucket size (default 6).")
     p.add_argument("--db", default=DB_PATH)
     p.add_argument("--show", type=int, default=10, help="Print top N values and reaches after scoring")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -327,8 +499,10 @@ def main():
         season=args.season,
         model_version=args.model_version,
         draft_format=args.draft_format,
+        bucket_size=args.bucket_size,
         db_path=args.db,
         projection_source=args.projection_source,
+        position_aware=args.position_aware,
     )
 
     if args.show:

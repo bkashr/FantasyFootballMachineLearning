@@ -2,9 +2,12 @@ import pytest
 
 from database import connect, upsert_many
 from scoring import (
+    _expected_for_position_rank,
     _expected_for_rank,
+    _synthetic_curve_by_position,
     _synthetic_curve_from_ppr_rank,
     build_value_curve,
+    build_value_curve_by_position,
     score_players,
     top_reaches,
     top_values,
@@ -243,3 +246,122 @@ def test_score_players_skips_players_with_no_adp(tmp_db):
     with connect(tmp_db) as conn:
         scores = conn.execute("SELECT COUNT(*) FROM player_scores").fetchone()[0]
     assert scores == 0
+
+
+def test_expected_for_position_rank_misses_when_position_unknown():
+    curves = {"QB": {0: 350, 1: 280}}
+    assert _expected_for_position_rank("RB", 5, curves, bucket_size=3) is None
+    assert _expected_for_position_rank(None, 5, curves, bucket_size=3) is None
+    assert _expected_for_position_rank("QB", None, curves, bucket_size=3) is None
+
+
+def test_expected_for_position_rank_extrapolates_within_position():
+    curves = {"QB": {0: 350, 1: 280, 2: 220}}
+    assert _expected_for_position_rank("QB", 1, curves, bucket_size=3) == 350
+    assert _expected_for_position_rank("QB", 5, curves, bucket_size=3) == 280
+    # Past the end: holds the last bucket flat
+    assert _expected_for_position_rank("QB", 50, curves, bucket_size=3) == 220
+
+
+def test_synthetic_curve_by_position_separates_positions(tmp_db):
+    # 3 QBs descending, 3 RBs descending — each should get its own curve
+    pids = _seed_players_and_stats(
+        tmp_db,
+        [
+            ("QB1", 400, None), ("QB2", 350, None), ("QB3", 300, None),
+            ("RB1", 250, None), ("RB2", 200, None), ("RB3", 150, None),
+        ],
+    )
+    # Override their positions (default seeded as WR)
+    with connect(tmp_db) as conn:
+        conn.execute("UPDATE players SET position='QB' WHERE full_name LIKE 'QB%'")
+        conn.execute("UPDATE players SET position='RB' WHERE full_name LIKE 'RB%'")
+        curves = _synthetic_curve_by_position(conn, 2023, bucket_size=1)
+
+    assert "QB" in curves and "RB" in curves
+    # Bucket 0 = top finisher at each position
+    assert curves["QB"][0] == 400
+    assert curves["RB"][0] == 250
+    # Bucket 2 = third finisher
+    assert curves["QB"][2] == 300
+    assert curves["RB"][2] == 150
+
+
+def test_position_aware_scoring_doesnt_overrate_cheap_qbs(tmp_db):
+    # Set up: 4 RBs (expected ~250 PPR at top of pos), and 1 cheap QB
+    # at QB12 projected to score 280. Flat curve would say "QB12 at
+    # overall ADP 50 should score 50 PPR" (mostly RB/WR at that ADP)
+    # → score = 280 - 50 = +230 huge value. Position-aware: "QB12 in
+    # this league scores ~280 average" → score ≈ 0.
+    pids = _seed_players_and_stats(
+        tmp_db,
+        [
+            ("RB Top",   300, None),
+            ("RB 2",     270, None),
+            ("RB 3",     240, None),
+            ("RB 4",     210, None),
+            # Plus a bunch of QBs to populate the QB curve
+            ("QB 1",     360, None),
+            ("QB 6",     300, None),
+            ("QB 12",    280, None),
+            ("QB 18",    240, None),
+        ],
+    )
+    with connect(tmp_db) as conn:
+        conn.execute("UPDATE players SET position='RB' WHERE full_name LIKE 'RB%'")
+        conn.execute("UPDATE players SET position='QB' WHERE full_name LIKE 'QB%'")
+
+    # ADP snapshots: position_rank for each
+    adp_rows = [
+        ("RB Top",   1.0,   1, "RB", 1),
+        ("QB 12",    50.0, 50, "QB", 12),
+    ]
+    with connect(tmp_db) as conn:
+        cols = ["player_id", "adp", "adp_rank", "position_rank", "draft_format", "source", "captured_at"]
+        conn.executemany(
+            f"INSERT INTO adp_snapshots ({','.join(cols)}) VALUES ({','.join(['?'] * len(cols))})",
+            [
+                [pids[name], adp, ovr, pr, "best_ball", "underdog", "2026-01-01T00:00:00"]
+                for name, adp, ovr, _, pr in adp_rows
+            ],
+        )
+
+    # Position-aware scoring on 2024 — projection from prior season
+    # (we seeded 2023). QB curve buckets[0..3] = [360, 300, 280, 240].
+    # QB 12 at position_rank 12 falls in bucket (12-1)//3 = 3 → 240.
+    # Projection for QB 12 is 280 (prior season). Score = 280 - 240 = +40.
+    score_players(season=2024, db_path=tmp_db, position_aware=True, bucket_size=3)
+
+    with connect(tmp_db) as conn:
+        scores = dict(conn.execute(
+            "SELECT p.full_name, s.score FROM player_scores s "
+            "JOIN players p USING (player_id) WHERE s.season=2024"
+        ))
+    # Both scored
+    assert "QB 12" in scores
+    assert "RB Top" in scores
+    # QB 12 not over-rewarded — compared to other QBs (240 expected), is roughly fair
+    assert abs(scores["QB 12"] - 40.0) < 1.0
+
+
+def test_position_aware_falls_back_to_synthetic_when_no_history(tmp_db):
+    # Just verify the path doesn't crash when there are no historical
+    # ADP snapshots to build a curve from.
+    pids = _seed_players_and_stats(
+        tmp_db,
+        [
+            ("Top WR", 300, None),
+            ("Mid WR", 200, None),
+            ("Low WR", 100, None),
+        ],
+    )
+    with connect(tmp_db) as conn:
+        conn.execute("UPDATE players SET position='WR'")
+        # ADP for one player
+        conn.execute(
+            "INSERT INTO adp_snapshots (player_id, adp, adp_rank, position_rank, "
+            "draft_format, source, captured_at) VALUES (?,?,?,?,?,?,?)",
+            (pids["Mid WR"], 30.0, 30, 15, "best_ball", "underdog", "2026-01-01T00:00:00"),
+        )
+    n = score_players(season=2024, db_path=tmp_db, position_aware=True, bucket_size=3)
+    assert n == 1
